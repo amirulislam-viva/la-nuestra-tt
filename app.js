@@ -785,7 +785,7 @@ function liveValidate() {
     if (g.p1 > g.p2) { s1++; re.textContent = "✔"; re.className = "set-res w"; }
     else { s2++; re.textContent = "✔"; re.className = "set-res w"; }
   }
-  const decided = s1 === SETS_TO_WIN[m.stage] || s2 === SETS_TO_WIN[m.stage];
+  const decided = s1 >= SETS_TO_WIN[m.stage] || s2 >= SETS_TO_WIN[m.stage];
   if (!err && !decided && games.some((g) => g.p1 != null && g.p2 != null)) {
     err = `One side must reach ${SETS_TO_WIN[m.stage]} set wins.`;
   }
@@ -795,13 +795,14 @@ function liveValidate() {
 
 function saveScore(m) {
   const r = liveValidate();
-  if (r.err) { toast("Please fix the highlighted sets."); return; }
+  if (r.err) { toast(r.err); return; }
   m.games = r.games;
   m.s1 = r.s1; m.s2 = r.s2;
   m.played = true;
   m.winner = r.s1 > r.s2 ? 1 : 2;
   m.date = resultDate(); // audit: when this result was recorded
-  if (!state.dateStamp) { state.dateStamp = m.date; save(); }
+  if (!state.dateStamp) { state.dateStamp = m.date; }
+  save();
   const wid = m.winner === 1 ? m.t1 : m.t2;
   closeModal();
   render();
