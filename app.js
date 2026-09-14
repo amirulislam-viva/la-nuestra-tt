@@ -11,6 +11,15 @@ const LS_KEY = "tt_tournament_v1";
 const POINTS_TO_WIN_SET = 11;
 const GAMES_OF = { group: 3, ko: 5 }; // best-of
 const SETS_TO_WIN = { group: 2, ko: 3 };
+const SESSION_STORAGE_KEY = "tt_active_session";
+const SESSION_CACHE_PREFIX = "tt_session_cache_";
+const SESSION_RESET_DATE_PREFIX = "tt_session_reset_date_";
+const AUTH_STORAGE_KEY = "tt_editor_auth";
+const EDITOR_KEY_HASH = "c0c08a59dda5854c23c26dcf1e8d65f8ca1faa7050245fd34eaa0d46809fcf1c";
+const JSONBIN_BIN_ID = "6aa7dea3ffd5d1605304bc1e";
+const JSONBIN_READ_KEY = "$2a$10$zKWLdxep3eXjVSGmfjKS9exd1Oem05hctL0nPpnBthvsjbu7YsEau";
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`;
+const AVAILABLE_SESSIONS = [{ id: "session-1", label: "Session 1" }];
 
 const STAGES = ["players", "draw", "teams", "fixtures"];
 const STEP_META = {
@@ -21,6 +30,8 @@ const STEP_META = {
 };
 
 let state = load();
+let activeSessionId = null;
+let editorAuthed = localStorage.getItem(AUTH_STORAGE_KEY) === "1";
 let modalCtx = null; // { matchId } while score modal open
 let toastTimer = null;
 
@@ -60,7 +71,10 @@ function fresh() {
   return { stage: "players", players: [], teams: null, matches: {}, order: null, ko: null, championId: null, zoom: 1 };
 }
 function save() {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(state)); }
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(state));
+    if (activeSessionId) storeSession(activeSessionId, state);
+  }
   catch (e) { console.warn("Could not save state:", e); }
 }
 
@@ -69,6 +83,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const initials = (n) => n.trim().split(/\s+/).map((w) => w[0]).join("").slice(0, 2).toUpperCase();
 const shuffle = (arr) => { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const signed = (n) => n > 0 ? `+${n}` : String(n);
 
 function toast(msg) {
   const t = $("toast");
@@ -76,6 +91,70 @@ function toast(msg) {
   t.classList.remove("hidden");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.add("hidden"), 2600);
+}
+
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function updateAuthButton() {
+  const btn = $("btnAuth");
+  if (btn) {
+    btn.textContent = editorAuthed ? "Logout" : "Login";
+    btn.title = editorAuthed ? "Logout editor mode" : "Login to edit results";
+    btn.classList.toggle("green", editorAuthed);
+  }
+  const reset = $("btnReset");
+  if (reset) reset.classList.toggle("hidden", !editorAuthed);
+}
+function requireEditor() {
+  if (editorAuthed) return true;
+  toast("Login required to edit results.");
+  openLoginModal();
+  return false;
+}
+function openLoginModal() {
+  openModal(`
+    <div class="m-title-row">
+      <h3>Editor Login</h3>
+      <button class="m-close" data-close="1" title="Close">✕</button>
+    </div>
+    <p class="m-sub">Enter the editor API key to update match results.</p>
+    <input class="input auth-input" id="authKey" type="password" autocomplete="current-password" placeholder="API key" />
+    <div class="err" id="authErr" style="margin-top:10px;"></div>
+    <div class="btn-row between" style="margin-top:16px;">
+      <button class="btn ghost" data-close="1">Cancel</button>
+      <button class="btn green" id="btnLoginSubmit">Login</button>
+    </div>
+  `);
+  const input = $("authKey");
+  input.focus();
+  const submit = async () => {
+    const hash = await sha256Hex(input.value);
+    if (hash !== EDITOR_KEY_HASH) {
+      $("authErr").textContent = "Invalid API key.";
+      return;
+    }
+    editorAuthed = true;
+    localStorage.setItem(AUTH_STORAGE_KEY, "1");
+    updateAuthButton();
+    closeModal();
+    render();
+    toast("Editor mode enabled.");
+  };
+  $("btnLoginSubmit").addEventListener("click", submit);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+}
+function toggleAuth() {
+  if (editorAuthed) {
+    editorAuthed = false;
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    updateAuthButton();
+    render();
+    toast("Logged out.");
+    return;
+  }
+  openLoginModal();
 }
 
 function playersInGroup(g) { return state.players.filter((p) => p.group === g); }
@@ -103,6 +182,125 @@ function resultDate() {
 function fmtDate(iso) {
   const d = new Date(iso + "T00:00:00");
   return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+/* ---------------- Sessions ---------------- */
+function sessionCacheKey(sessionId) { return SESSION_CACHE_PREFIX + sessionId; }
+function sessionResetDateKey(sessionId) { return SESSION_RESET_DATE_PREFIX + sessionId; }
+const CACHE_RESET_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function cacheResetRemaining(sessionId) {
+  const lastReset = Number(localStorage.getItem(sessionResetDateKey(sessionId)) || 0);
+  return lastReset > 0 ? Math.max(0, CACHE_RESET_COOLDOWN_MS - (Date.now() - lastReset)) : 0;
+}
+
+function cachedSession(sessionId) {
+  try {
+    const raw = localStorage.getItem(sessionCacheKey(sessionId));
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    console.warn("Could not read cached session:", e);
+    localStorage.removeItem(sessionCacheKey(sessionId));
+    return null;
+  }
+}
+
+function storeSession(sessionId, sessionState) {
+  localStorage.setItem(sessionCacheKey(sessionId), JSON.stringify(sessionState));
+}
+
+function openSession(sessionId, sessionState, source) {
+  state = sessionState;
+  activeSessionId = sessionId;
+  save();
+  render();
+  toast(`${sessionId} loaded${source === "cache" ? " from cache" : ""}.`);
+}
+
+function renderSessionLanding() {
+  document.body.classList.remove("roadmap-mode");
+  $("stepper").innerHTML = "";
+  $("app").innerHTML = `
+    <div class="session-page">
+      <div class="stage-head">
+        <h2 class="stage-title">Tournament Sessions</h2>
+        <p class="stage-sub">Choose a session to view its tournament roadmap.</p>
+      </div>
+      <div class="session-grid">
+        ${AVAILABLE_SESSIONS.map((s) => {
+          const hasCache = !!cachedSession(s.id);
+          const resetUsed = cacheResetRemaining(s.id) > 0;
+          return `
+            <div class="session-card-wrap">
+              <button class="session-card" data-session="${esc(s.id)}">
+                <span class="session-kicker">${hasCache ? "Cached session" : "Saved session"}</span>
+                <span class="session-title">${esc(s.label)}</span>
+                <span class="session-sub">${hasCache ? "Open cached tournament results" : "Fetch tournament results"}</span>
+              </button>
+              <button class="btn ghost session-reset" data-reset-session="${esc(s.id)}" ${hasCache && !resetUsed ? "" : "disabled"} title="Refresh this session from the server. Available once every 24 hours.">↻ Reset cache</button>
+            </div>`;
+        }).join("")}
+      </div>
+    </div>`;
+  document.querySelectorAll("[data-session]").forEach((el) => {
+    el.addEventListener("click", () => loadSession(el.dataset.session));
+  });
+  document.querySelectorAll("[data-reset-session]").forEach((el) => {
+    el.addEventListener("click", () => resetSessionCache(el.dataset.resetSession));
+  });
+}
+
+function renderSessionLoading(sessionId, message = "Fetching saved tournament data...") {
+  $("app").innerHTML = `
+    <div class="card session-loading">
+      <div class="stage-head"><h2 class="stage-title">Loading ${esc(sessionId)}</h2></div>
+      <div class="empty-hint">${esc(message)}</div>
+    </div>`;
+}
+
+function loadSession(sessionId) {
+  const sessionState = cachedSession(sessionId);
+  if (sessionState) {
+    openSession(sessionId, sessionState, "cache");
+    return;
+  }
+  fetchAndCacheSession(sessionId);
+}
+
+async function fetchAndCacheSession(sessionId) {
+  try {
+    renderSessionLoading(sessionId);
+    const res = await fetch(JSONBIN_URL, {
+      headers: {
+        "X-Access-Key": JSONBIN_READ_KEY,
+        "X-Bin-Meta": "false",
+      },
+    });
+    if (!res.ok) throw new Error(`JSONBin read failed (${res.status})`);
+    const data = await res.json();
+    const remoteState = data.sessions && data.sessions[sessionId];
+    if (!remoteState) throw new Error(`${sessionId} was not found`);
+    storeSession(sessionId, remoteState);
+    openSession(sessionId, remoteState, "remote");
+  } catch (e) {
+    console.warn(e);
+    activeSessionId = null;
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+    renderSessionLanding();
+    toast("Could not load session. Please try again.");
+  }
+}
+
+function resetSessionCache(sessionId) {
+  const remaining = cacheResetRemaining(sessionId);
+  if (remaining > 0) {
+    const hours = Math.ceil(remaining / (60 * 60 * 1000));
+    toast(`Cache reset available again in about ${hours} hour${hours === 1 ? "" : "s"}.`);
+    return;
+  }
+  localStorage.removeItem(sessionCacheKey(sessionId));
+  localStorage.setItem(sessionResetDateKey(sessionId), String(Date.now()));
+  fetchAndCacheSession(sessionId);
 }
 
 /* ---------------- Validation ---------------- */
@@ -134,7 +332,7 @@ function renderStepper() {
     const st = stepState(key);
     const done = st === "done";
     const icon = done ? "✓" : STEP_META[key].n;
-    const clickable = done || (key === "teams" && state.teams);
+    const clickable = key === "players" || key === "draw" || (key === "teams" && state.teams) || (key === "fixtures" && Object.keys(state.matches || {}).length);
     return `
       <div class="step ${st} ${clickable ? "clickable" : ""}" data-step="${key}" title="${esc(STEP_META[key].label)}">
         <span class="dot">${icon}</span><span>${esc(STEP_META[key].label)}</span>
@@ -178,13 +376,15 @@ function renderPlayers() {
         ${groupCardHTML("B")}
       </div>
       <div class="btn-row">
-        <button class="btn primary big" id="btnGoDraw" ${ok ? "" : "disabled"}>Proceed to Draw →</button>
-        ${!ok ? `<span class="muted" style="align-self:center;font-size:13px;">Needs equal groups (A: ${a} / B: ${b}, min 2 each)</span>` : ""}
+        ${editorAuthed ? `<button class="btn primary big" id="btnGoDraw" ${ok ? "" : "disabled"}>Proceed to Draw →</button>` : `<span class="muted" style="align-self:center;font-size:13px;">Read-only player list</span>`}
+        ${!ok && editorAuthed ? `<span class="muted" style="align-self:center;font-size:13px;">Needs equal groups (A: ${a} / B: ${b}, min 2 each)</span>` : ""}
       </div>
     </div>
   `;
-  bindGroupCard("A"); bindGroupCard("B");
-  $("btnGoDraw").addEventListener("click", () => { state.stage = "draw"; save(); render(); });
+  if (editorAuthed) {
+    bindGroupCard("A"); bindGroupCard("B");
+    $("btnGoDraw").addEventListener("click", () => { state.stage = "draw"; save(); render(); });
+  }
 }
 
 function groupCardHTML(g) {
@@ -194,7 +394,7 @@ function groupCardHTML(g) {
       <span class="p-avatar">${esc(initials(p.name))}</span>
       <span class="p-name">${esc(p.name)}</span>
       <span class="p-num">#${i + 1}</span>
-      <button class="x" data-del="${p.id}" title="Remove player">✕</button>
+      ${editorAuthed ? `<button class="x" data-del="${p.id}" title="Remove player">✕</button>` : ""}
     </li>
   `).join("");
   return `
@@ -203,11 +403,11 @@ function groupCardHTML(g) {
         <span class="group-tag"><span class="${g === "A" ? "chip-a" : "chip-b"}">${g}</span> Group ${g}</span>
         <span class="count-badge">${list.length} player${list.length === 1 ? "" : "s"}</span>
       </div>
-      <form class="add-row" data-gform="${g}">
+      ${editorAuthed ? `<form class="add-row" data-gform="${g}">
         <input class="input" id="inp${g}" maxlength="24" placeholder="Player name…" autocomplete="off" />
         <button class="btn ${g === "A" ? "primary" : "blue"}" type="submit">+ Add</button>
-      </form>
-      ${list.length ? `<ul class="player-list">${items}</ul>` : `<div class="empty-hint">No players yet — add the first one above.</div>`}
+      </form>` : ""}
+      ${list.length ? `<ul class="player-list">${items}</ul>` : `<div class="empty-hint">No players yet.</div>`}
     </div>
   `;
 }
@@ -246,17 +446,17 @@ function renderDraw() {
       </div>
       ${state.teams ? `
         <div class="btn-row between">
-          <div class="btn-row" style="margin:0;">
+          ${editorAuthed ? `<div class="btn-row" style="margin:0;">
             <button class="btn ghost" id="btnRedraw">🎲 Re-draw</button>
             <button class="btn ghost" id="btnEditPlayers">← Edit players</button>
-          </div>
+          </div>` : `<span class="muted" style="align-self:center;font-size:13px;">Read-only draw</span>`}
           <button class="btn primary big" id="btnGoFixtures">Roadmap →</button>
         </div>
         <h3 class="round-title" style="margin-top:22px;">Teams (${teamsArray().length})</h3>
         <div class="team-grid">${teamsArray().map(teamCardHTML).join("")}</div>
       ` : `
         <div class="btn-row">
-          <button class="btn primary big" id="btnDoDraw">🎲 Draw Teams</button>
+          ${editorAuthed ? `<button class="btn primary big" id="btnDoDraw">🎲 Draw Teams</button>` : `<span class="muted" style="align-self:center;font-size:13px;">Draw has not been created yet.</span>`}
           <button class="btn ghost" id="btnBackPlayers">← Back to players</button>
         </div>
         <div class="empty-hint" style="margin-top:20px;">
@@ -271,11 +471,13 @@ function renderDraw() {
   if (bp) bp.addEventListener("click", () => { state.stage = "players"; save(); render(); });
   const br = $("btnRedraw");
   if (br) br.addEventListener("click", () => {
+    if (!requireEditor()) return;
     if (!confirm("Re-draw will discard all teams and every recorded result. Continue?")) return;
     doDraw();
   });
   const be = $("btnEditPlayers");
   if (be) be.addEventListener("click", () => {
+    if (!requireEditor()) return;
     if (!confirm("Editing players will discard teams, fixtures and results drawn so far. Continue?")) return;
     state.teams = null; state.matches = {}; state.order = null; state.ko = null; state.championId = null;
     state.stage = "players"; save(); render();
@@ -285,6 +487,7 @@ function renderDraw() {
 }
 
 function doDraw() {
+  if (!requireEditor()) return;
   const a = shuffle(playersInGroup("A"));
   const b = shuffle(playersInGroup("B"));
   const n = Math.min(a.length, b.length);
@@ -416,12 +619,16 @@ function standings() {
     if (m.winner === 1) { r1.w++; r2.l++; r1.pts += 2; }
     else { r2.w++; r1.l++; r2.pts += 2; }
   });
-  rows.forEach((r) => { r.sd = r.sf - r.sa; r.pd = r.pf - r.pa; });
+  rows.forEach((r) => {
+    r.sd = r.sf - r.sa;
+    r.pd = r.pf - r.pa;
+  });
   rows.sort((x, y) =>
     y.pts - x.pts ||
     y.w - x.w ||
     y.sd - x.sd ||
     y.pd - x.pd ||
+    y.pf - x.pf ||
     x.t.name.localeCompare(y.t.name)
   );
   return rows;
@@ -449,7 +656,10 @@ function bindMatchClicks() {
   document.querySelectorAll("[data-mid]").forEach((el) =>
     el.addEventListener("click", () => {
       const m = findMatchAny(el.dataset.mid);
-      if (m && m.t1 && m.t2) openScoreModal(m.id);
+      if (m && m.t1 && m.t2) {
+        if (!editorAuthed) { requireEditor(); return; }
+        openScoreModal(m.id);
+      }
     })
   );
 }
@@ -600,11 +810,12 @@ function renderRoadmap() {
   const tableHTML = `
     <details class="card table-card">
       <summary>🏆 Points Table &amp; Qualification <span class="rbadge">${qual === 2 ? "Top 2 → Final" : "Top 4 → Semis"}</span></summary>
+      <div class="table-note">Ranking tie-break: match wins -> set difference -> point difference -> points scored.</div>
       <div class="table-wrap" style="margin-top:12px;">
         <table>
           <thead><tr>
-            <th>#</th><th>Team</th><th class="num">P</th><th class="num">W</th><th class="num">L</th>
-            <th class="num">Sets</th><th class="num">Pts</th>
+            <th># <span class="info" title="Current ranking position" aria-label="Current ranking position">i</span></th><th>Team <span class="info" title="Team name" aria-label="Team name">i</span></th><th class="num">P <span class="info" title="Matches played" aria-label="Matches played">i</span></th><th class="num">W <span class="info" title="Matches won" aria-label="Matches won">i</span></th><th class="num">L <span class="info" title="Matches lost" aria-label="Matches lost">i</span></th>
+            <th class="num">Sets <span class="info" title="Sets won : sets lost" aria-label="Sets won : sets lost">i</span></th><th class="num">Set +/- <span class="info" title="Set difference: sets won minus sets lost" aria-label="Set difference: sets won minus sets lost">i</span></th><th class="num">Point +/- <span class="info" title="Point difference: points won minus points lost" aria-label="Point difference: points won minus points lost">i</span></th><th class="num">PF <span class="info" title="Points for: total points scored" aria-label="Points for: total points scored">i</span></th><th class="num">Pts <span class="info" title="Table points: 2 points per match win" aria-label="Table points: 2 points per match win">i</span></th>
           </tr></thead>
           <tbody>
             ${rows.map((r, i) => `
@@ -615,6 +826,9 @@ function renderRoadmap() {
                 <td class="num">${r.w}</td>
                 <td class="num">${r.l}</td>
                 <td class="num muted">${r.sf}:${r.sa}</td>
+                <td class="num">${signed(r.sd)}</td>
+                <td class="num">${signed(r.pd)}</td>
+                <td class="num muted">${r.pf}</td>
                 <td class="num pts">${r.pts}</td>
               </tr>
             `).join("")}
@@ -628,14 +842,14 @@ function renderRoadmap() {
     <div class="banner gold">
       <span class="big">🏁</span>
       <div style="flex:1;">Group stage complete — ${qual === 2 ? "the top 2" : "the top 4"} team${qual === 2 ? "s are" : "s are"} through!</div>
-      <button class="btn primary" id="btnToKO">Start Knockout →</button>
+      ${editorAuthed ? `<button class="btn primary" id="btnToKO">Start Knockout →</button>` : `<span class="muted" style="align-self:center;font-size:13px;">Login to start knockout</span>`}
     </div>` : "";
 
   $("app").innerHTML = `
     <div class="roadmap-page">
       <div class="stage-head">
         <h2 class="stage-title">${koStage ? "Knockout Roadmap 🥊" : "Tournament Roadmap 🗺️"}</h2>
-        <p class="stage-sub">Left to right: group rounds ${qual === 4 ? "→ semi-finals " : ""}→ final → champion. Click any match to enter its score. Use <b>Ctrl + scroll</b> or the buttons to zoom.</p>
+        <p class="stage-sub">Left to right: group rounds ${qual === 4 ? "→ semi-finals " : ""}→ final → champion. ${editorAuthed ? "Click any match to enter its score." : "Login to edit match scores."} Use <b>Ctrl + scroll</b> or the buttons to zoom.</p>
       </div>
       <div class="bracket-toolbar">
         <div class="btn-row" style="margin:0;">
@@ -682,6 +896,7 @@ function renderRoadmap() {
 
 /* ---------------- Score modal ---------------- */
 function openScoreModal(mid) {
+  if (!requireEditor()) return;
   const m = findMatchAny(mid);
   if (!m) return;
   modalCtx = { matchId: mid, ko: m.stage === "ko" };
@@ -794,6 +1009,7 @@ function liveValidate() {
 }
 
 function saveScore(m) {
+  if (!requireEditor()) return;
   const r = liveValidate();
   if (r.err) { toast(r.err); return; }
   m.games = r.games;
@@ -813,6 +1029,7 @@ function saveScore(m) {
    KNOCKOUT — semis (T1vT4, T2vT3) + final, or straight final
    ============================================================ */
 function buildKnockout() {
+  if (!requireEditor()) return;
   const rows = standings();
   const qual = knockoutSize();
   const top = rows.slice(0, qual).map((r) => r.t.id);
@@ -833,15 +1050,24 @@ function buildKnockout() {
 /* ============================================================
    RESET + ROUTER
    ============================================================ */
+$("btnAuth").addEventListener("click", toggleAuth);
+updateAuthButton();
+
 $("btnReset").addEventListener("click", () => {
+  if (!requireEditor()) return;
   if (!confirm("Reset everything — players, teams, fixtures and results will be wiped. Continue?")) return;
   state = fresh();
+  activeSessionId = null;
   save();
   render();
   toast("Tournament reset.");
 });
 
 function render() {
+  if (!activeSessionId) {
+    renderSessionLanding();
+    return;
+  }
   document.body.classList.toggle("roadmap-mode", state.stage === "fixtures");
   renderStepper();
   switch (state.stage) {
